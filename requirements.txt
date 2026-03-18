@@ -1,0 +1,17 @@
+# Telegram
+python-telegram-bot==21.6
+
+# Ollama client
+ollama==0.4.7
+
+# MongoDB
+pymongo==4.9.1
+
+# Environment
+python-dotenv==1.0.1
+
+# Plotting (Sprint 3, but install now)
+matplotlib
+
+# Image handling
+Pillow==10.4.0
