@@ -15,9 +15,12 @@ TEXT_MODEL = "llama3.1:8b"
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 MONGO_DB = os.getenv("MONGO_DB", "health_tracker")
 
-# Qdrant (Sprint 2)
-QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
-QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
+# Weaviate
+WEAVIATE_HOST = os.getenv("WEAVIATE_HOST", "localhost")
+WEAVIATE_PORT = int(os.getenv("WEAVIATE_PORT", "8080"))
+
+# Embedding model (lokal auf GPU)
+EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 # Energy tracking
 GPU_TDP_WATTS = float(os.getenv("GPU_TDP_WATTS", "220"))

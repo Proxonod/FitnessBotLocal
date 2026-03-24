@@ -19,7 +19,7 @@ def main():
     print("   Ctrl+C to stop\n")
 
     bot = create_bot()
-    bot.run_polling(drop_pending_updates=True) # False when offline MSG should get read also
+    bot.run_polling(drop_pending_updates=False) # False when offline MSG should get read also
 
 
 if __name__ == "__main__":

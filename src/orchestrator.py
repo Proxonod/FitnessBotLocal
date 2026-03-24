@@ -17,7 +17,8 @@ import json
 from src.model_manager import ModelManager, UsageStats
 from src.database import Database
 from src.config import TEXT_MODEL, VISION_MODEL
-
+from src.vector_store import VectorStore
+from src.food_lookup import FoodLookup
 
 SYSTEM_PROMPT = """Du bist ein freundlicher Ernährungs-Tracker-Assistent.
 Du hilfst beim Tracken von Mahlzeiten, Kalorien und Makronährstoffen.
@@ -68,6 +69,8 @@ class Orchestrator:
     def __init__(self):
         self.model_manager = ModelManager()
         self.db = Database()
+        self.vector_store = VectorStore()
+        self.food_lookup = FoodLookup()
         # Conversation state per user: {telegram_id: {"last_action": ..., "last_meal": ...}}
         self.user_state = {}
 
@@ -332,8 +335,8 @@ class Orchestrator:
             # Save to DB
             self.db.log_meal(telegram_id, meal_data)
             self.user_state[telegram_id] = {
-                "last_action": "awaiting_confirmation",
-                "last_meal": meal_data,
+                "last_action": "idle",
+                "last_meal": meal_data,  # behalten für Korrekturen
             }
 
             # Format nice response
@@ -451,9 +454,7 @@ class Orchestrator:
         if intent["intent"] == "quick_amount":
             name = intent["data"]["name"]
             amount = intent["data"]["amount_g"]
-            # Hier kommt in Sprint 2 der Qdrant-Lookup
-            # Für jetzt: ans LLM schicken zum Schätzen
-            return await self._llm_estimate(telegram_id, f"{amount}g {name}")
+            return await self._lookup_and_estimate(telegram_id, name, amount)
 
         # --- Portion update: "die Hälfte" ---
         if intent["intent"] == "portion_update":
@@ -471,6 +472,64 @@ class Orchestrator:
 
         # --- LLM needed ---
         return await self._llm_estimate(telegram_id, text)
+
+    async def _lookup_and_estimate(self, telegram_id: int,
+                                   name: str, amount_g: float) -> str:
+        """
+        Lookup flow:
+          1. Weaviate hybrid search
+          2. OpenFoodFacts fallback (+ cache result in Weaviate)
+          3. LLM fallback
+        """
+        # --- Step 1: Weaviate ---
+        print(f"  🔍 Weaviate lookup: '{name}'...")
+        product = self.vector_store.search_best(name)
+
+        if product and product["_score"] > 0.3:
+            print(f"  ✅ Weaviate hit: {product['name']} (score={product['_score']:.2f})")
+            return self._calculate_portion(product, amount_g)
+
+        # --- Step 2: OpenFoodFacts ---
+        print(f"  🌍 OpenFoodFacts lookup: '{name}'...")
+        off_product = self.food_lookup.search_best(name)
+
+        if off_product:
+            print(f"  ✅ OpenFoodFacts hit: {off_product['name']}")
+            # Cache in Weaviate for next time
+            off_product["added_by"] = telegram_id
+            self.vector_store.add_product(off_product)
+
+            return self._calculate_portion(off_product, amount_g)
+
+        # --- Step 3: LLM fallback ---
+        print(f"  🧠 No DB hit — falling back to LLM for '{name}'")
+        return await self._llm_estimate(telegram_id, f"{amount_g}g {name}")
+
+    def _calculate_portion(self, product: dict, amount_g: float) -> str:
+        """Calculate macros for a given amount based on per-100g values."""
+        factor = amount_g / 100.0
+        per100 = product["per_100g"]
+
+        total = {k: round(v * factor, 1) for k, v in per100.items()}
+
+        name = product["name"]
+        brand = product.get("brand", "")
+        source = product.get("source", "")
+        source_tag = "📦 OpenFoodFacts" if source == "openfoodfacts" else "🧀 OWN Produkt-DB"
+
+        lines = [
+            f"🍽️ **{name}**{f' ({brand})' if brand else ''}\n",
+            f"📏 Portion: {amount_g}g\n",
+            f"🔥 {total.get('kcal', 0)} kcal",
+            f"🥩 {total.get('protein_g', 0)}g Protein",
+            f"🍞 {total.get('carbs_g', 0)}g Kohlenhydrate",
+            f"🧈 {total.get('fat_g', 0)}g Fett",
+            f"🌿 {total.get('fiber_g', 0)}g Ballaststoffe",
+            f"\n{source_tag}",
+        ]
+        return "\n".join(lines)
+
+
 
     async def _llm_estimate(self, telegram_id: int, text: str) -> str:
         """Fallback: LLM schätzt Nährwerte aus Freitext."""
@@ -511,8 +570,8 @@ class Orchestrator:
 
             self.db.log_meal(telegram_id, meal_data)
             self.user_state[telegram_id] = {
-                "last_action": "awaiting_confirmation",
-                "last_meal": meal_data,
+                "last_action": "idle",
+                "last_meal": meal_data,  # behalten für Korrekturen
             }
             return self._format_meal_response(meal_data)
 
@@ -556,7 +615,6 @@ class Orchestrator:
         if notes:
             lines.append(f"💡 {notes}")
 
-        lines.append("\n_Stimmt das so? Sag 'korrigiere: ...' zum Anpassen._")
 
         return "\n".join(lines)
 

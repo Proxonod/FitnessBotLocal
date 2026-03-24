@@ -15,3 +15,9 @@ matplotlib
 
 # Image handling
 Pillow==10.4.0
+
+# Vector DB
+weaviate-client==4.6.5
+sentence-transformers==3.0.1
+
+openfoodfacts == 1.1
