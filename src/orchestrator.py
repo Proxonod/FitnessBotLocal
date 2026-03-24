@@ -365,10 +365,14 @@ class Orchestrator:
                 return (
                     f"👋 Hey {user_name}! Ich bin dein Ernährungs-Tracker.\n\n"
                     f"📸 Schick mir ein Foto von deinem Essen\n"
-                    f"📝 Schreib mir was du gegessen hast\n"
+                    f"📝 Schreib mir was du gegessen hast (z.B. '300g Hähnchen')\n"
                     f"📊 /today → Tagesübersicht\n"
                     f"📈 /stats → Verbrauch\n"
-                    f"🧀 /products → Produkt-DB\n\nLos geht's!"
+                    f"🧀 /products → Produkt-DB\n\n"
+                    f"💡 _Du kannst jederzeit die letzte Mahlzeit korrigieren:_\n"
+                    f"  • 'korrigiere: Protein war 30g'\n"
+                    f"  • 'nein, waren nur 400 kcal'\n"
+                    f"  • 'füg noch 20g Eiweiß hinzu'"
                 )
             if cmd in ("/today", "heute"):
                 return self._daily_summary(telegram_id)
