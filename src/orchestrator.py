@@ -127,6 +127,9 @@ class Orchestrator:
             signals["is_correction"] = True
         if words & correction_words:
             signals["is_correction"] = True
+        # ---- 4.1 Delete Arguments
+        delete_words = {"lösch", "losch", "delete", "entfern", "raus", "weg",
+                        "falsch", "cancel", "abbruch", "rückgängig"}
 
         # --- 5. Makro-Angaben extrahieren ---
         macro_aliases = {
@@ -234,6 +237,11 @@ class Orchestrator:
         # Fall 8: Portions-Angabe: "Die Hälfte davon"
         if has_portion:
             return {"intent": "portion_update", "data": signals["portion"]}
+
+        # Löschen
+
+        if words & delete_words:
+            return {"intent": "delete_last", "data": None}
 
         # Fall 9: Nichts Konkretes erkannt → LLM
         return {"intent": "llm_needed", "data": text}
@@ -407,7 +415,7 @@ class Orchestrator:
             print(f"    -> trying: '{attempt}'")
 
             result = self.vector_store.search_best(attempt)
-            if result and result["_score"] > 0.3:
+            if result and result["_score"] > 0.8:
                 print(f"    -> Weaviate hit: {result['name']} ({result['_score']:.2f})")
                 return result
 
@@ -556,6 +564,13 @@ class Orchestrator:
                               for k, v in macros.items())
             return f"✅ Geloggt: {found}"
 
+        if intent["intent"] == "delete_last":
+            success = self.db.delete_last_meal(telegram_id)
+            if success:
+                self.user_state[telegram_id] = {"last_action": "idle", "last_meal": None}
+                return "Letzter Eintrag geloescht."
+            return "Kein Eintrag zum Loeschen gefunden."
+
         # --- Quick amount: "300g Käse" ---
         if intent["intent"] == "quick_amount":
             name = intent["data"]["name"]
@@ -591,7 +606,7 @@ class Orchestrator:
         print(f"  🔍 Weaviate lookup: '{name}'...")
         product = self.vector_store.search_best(name)
 
-        if product and product["_score"] > 0.3:
+        if product and product["_score"] > 0.8:
             print(f"  ✅ Weaviate hit: {product['name']} (score={product['_score']:.2f})")
             return self._calculate_portion(product, amount_g)
 

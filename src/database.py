@@ -60,6 +60,17 @@ class Database:
             {"$set": {"goals": goals}}
         )
 
+    def delete_last_meal(self, telegram_id: int) -> bool:
+        """Delete the most recent meal entry for a user."""
+        last = self.meals.find_one(
+            {"telegram_id": telegram_id},
+            sort=[("timestamp", -1)]
+        )
+        if last:
+            self.meals.delete_one({"_id": last["_id"]})
+            print(f"  🗑️ Deleted last meal for {telegram_id}")
+            return True
+        return False
     # --- Meals ---
 
     def log_meal(self, telegram_id: int, meal_data: dict) -> str:
