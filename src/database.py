@@ -53,6 +53,49 @@ class Database:
             print(f"  👤 New user created: {name} ({telegram_id})")
         return user
 
+    def get_multi_day_totals(self, telegram_id: int,
+                             days: int = 7) -> list[dict]:
+        """Aggregiert Nährwerte der letzten N Tage."""
+        from datetime import timedelta
+        today = datetime.now(timezone.utc).date()
+        dates = [
+            (today - timedelta(days=i)).strftime("%Y-%m-%d")
+            for i in range(days - 1, -1, -1)
+        ]
+
+        pipeline = [
+            {"$match": {
+                "telegram_id": telegram_id,
+                "date": {"$in": dates}
+            }},
+            {"$group": {
+                "_id": "$date",
+                "kcal": {"$sum": "$total.kcal"},
+                "protein_g": {"$sum": "$total.protein_g"},
+                "carbs_g": {"$sum": "$total.carbs_g"},
+                "fat_g": {"$sum": "$total.fat_g"},
+                "fiber_g": {"$sum": "$total.fiber_g"},
+                "meal_count": {"$sum": 1},
+            }},
+            {"$sort": {"_id": 1}}
+        ]
+
+        results = {r["_id"]: r for r in self.meals.aggregate(pipeline)}
+
+        # Alle Tage auffüllen, auch leere
+        return [
+            {
+                "date": d,
+                "kcal": results.get(d, {}).get("kcal", 0) or 0,
+                "protein_g": results.get(d, {}).get("protein_g", 0) or 0,
+                "carbs_g": results.get(d, {}).get("carbs_g", 0) or 0,
+                "fat_g": results.get(d, {}).get("fat_g", 0) or 0,
+                "fiber_g": results.get(d, {}).get("fiber_g", 0) or 0,
+                "meal_count": results.get(d, {}).get("meal_count", 0),
+            }
+            for d in dates
+        ]
+
     def update_user_goals(self, telegram_id: int, goals: dict):
         """Update user's nutrition goals."""
         self.users.update_one(

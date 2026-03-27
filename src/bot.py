@@ -69,7 +69,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    await update.message.chat.send_action("Hört Müll an")
+    await update.message.chat.send_action("typing")
 
     voice_file = await context.bot.get_file(update.message.voice.file_id)
     buf = io.BytesIO()
@@ -83,7 +83,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Falls medium genutzt wurde -> User kurz informieren was passiert
     if result["model_used"] == "medium":
-        await update.message.chat.send_action("Hört genauer hin")
+        await update.message.chat.send_action("typing")
 
     text = result["text"]
 
@@ -128,6 +128,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(response, parse_mode="Markdown")
 
+async def _cmd_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    # Zahl aus Argument holen: /last 3
+    try:
+        days = int(context.args[0]) if context.args else 7
+        days = max(days, 1)  # 1-x Tage
+    except (ValueError, IndexError):
+        days = 7
+    response = await orchestrator.handle_text(
+        user.id, user.first_name, f"/last {days}"
+    )
+    await update.message.reply_text(response, parse_mode="Markdown")
 
 def create_bot() -> Application:
     """Create and configure the Telegram bot."""
@@ -138,6 +150,9 @@ def create_bot() -> Application:
     app.add_handler(CommandHandler("today", lambda u, c: _cmd(u, c, "/today")))
     app.add_handler(CommandHandler("stats", lambda u, c: _cmd(u, c, "/stats")))
     app.add_handler(CommandHandler("products", lambda u, c: _cmd(u, c, "/products")))
+    app.add_handler(CommandHandler("weekly", lambda u, c: _cmd(u, c, "/weekly")))
+    app.add_handler(CommandHandler("overview", lambda u, c: _cmd(u, c, "/weekly")))
+    app.add_handler(CommandHandler("last", lambda u, c: _cmd_last(u, c)))
 
 
     # Message handlers

@@ -108,7 +108,7 @@ class Orchestrator:
 
         # Manuelle Goal-Eingabe: "ziel: 2000 kcal, 150g protein..."
         if lower.startswith("ziel:") or lower.startswith("goal:") or lower.startswith("aim:"):
-            return self._parse_manual_goals(telegram_id, text)
+            return {"intent": "manual_goals", "data": text}
 
         # --- 2. Grüße ---
         greetings = ("hi", "hallo", "hey", "moin", "start", "servus", "sers")
@@ -138,8 +138,9 @@ class Orchestrator:
         if words & retry_words:
             return {"intent": "voice_retry", "data": None}
         # ---- 4.1 Delete Arguments
-        delete_words = {"lösch", "losch", "delete", "entfern", "raus", "weg",
-                        "falsch", "cancel", "abbruch", "rückgängig"}
+        delete_words = {"lösch", "losch", "delete", "entfern",
+                        "cancel", "abbruch", "rückgängig"}
+        # "falsch", "weg", "raus" raus — zu viele Kollisionen
 
         # --- 5. Makro-Angaben extrahieren ---
         macro_aliases = {
@@ -430,6 +431,33 @@ class Orchestrator:
             f"Carbs: *{goals['daily_carbs_g']}g*"
         )
 
+    def _progress_bar(self, current: float, goal: float,
+                      emoji_fill: str, width: int = 10) -> str:
+        """
+        Erzeugt einen Text-Fortschrittsbalken.
+        z.B. "🥩🥩🥩🥩🥩⬜⬜⬜⬜⬜ 87/150g"
+        """
+        if goal <= 0:
+            return f"{current:.0f} (kein Ziel gesetzt)"
+
+        ratio = min(current / goal, 1.5)  # cap bei 150%
+        filled = round(ratio * width)
+        filled = min(filled, width)
+
+        bar = emoji_fill * filled + "⬜" * (width - filled)
+
+        pct = (current / goal) * 100
+
+        # Ueber Ziel?
+        if current > goal * 1.05:
+            status = " ⚠️ UEBER ZIEL"
+        elif current >= goal * 0.95:
+            status = " ✅"
+        else:
+            status = ""
+
+        return f"{bar} {current:.0f}/{goal:.0f}{status}"
+
     def _lookup_with_retry(self, name: str, telegram_id: int = 0) -> dict | None:
         """
         DB-Lookup mit kuerzer werdendem Namen als Fallback.
@@ -540,6 +568,16 @@ class Orchestrator:
                 return self._usage_summary(telegram_id)
             if cmd in ("/products", "produkte"):
                 return self._products_summary(telegram_id)
+            if cmd in ("/weekly", "/overview"):
+                return self._weekly_summary(telegram_id, days=7)
+
+            # /last N
+            if cmd.startswith("/last"):
+                try:
+                    days = int(cmd.split()[1])
+                except (IndexError, ValueError):
+                    days = 7
+                return self._weekly_summary(telegram_id, days=days)
 
         # --- Bestätigung ---
         if intent["intent"] == "confirm_meal":
@@ -565,8 +603,10 @@ class Orchestrator:
         if intent["intent"] == "correct_meal":
             self.user_state[telegram_id] = {"last_action": "awaiting_correction"}
             return "✏️ Was soll ich korrigieren? Sag z.B. 'Protein war 25g' oder 'waren nur 200 kcal'"
-        if intent["intent"] == "voice_retry":
-            return "Schick mir die Sprachnachricht nochmal — ich verwende dann das groessere Modell."
+        # ----- goal update ----
+        if intent["intent"] == "manual_goals":
+            return self._parse_manual_goals(telegram_id, intent["data"])
+
         # --- Korrektur mit Werten: "Nein, waren 400 kcal" ---
         if intent["intent"] == "correct_with_values":
             macros = intent["data"]
@@ -793,19 +833,71 @@ class Orchestrator:
         return "\n".join(lines)
 
     def _daily_summary(self, telegram_id: int) -> str:
-        """Generate daily nutrition summary."""
         totals = self.db.get_daily_totals(telegram_id)
         meals = self.db.get_daily_meals(telegram_id)
+        user = self.db.users.find_one({"telegram_id": telegram_id}) or {}
+        goals = user.get("goals", {})
 
         if not meals:
-            return "📭 Noch keine Mahlzeiten heute geloggt."
+            return "Noch keine Mahlzeiten heute geloggt."
 
-        lines = [f"📊 **Tagesübersicht** ({totals.get('meal_count', 0)} Mahlzeiten)\n"]
-        lines.append(f"🔥 {totals.get('total_kcal', 0):.0f} kcal")
-        lines.append(f"🥩 {totals.get('total_protein', 0):.0f}g Protein")
-        lines.append(f"🍞 {totals.get('total_carbs', 0):.0f}g Kohlenhydrate")
-        lines.append(f"🧈 {totals.get('total_fat', 0):.0f}g Fett")
-        lines.append(f"🌿 {totals.get('total_fiber', 0):.0f}g Ballaststoffe")
+        kcal = totals.get("total_kcal", 0) or 0
+        protein = totals.get("total_protein", 0) or 0
+        carbs = totals.get("total_carbs", 0) or 0
+        fat = totals.get("total_fat", 0) or 0
+        fiber = totals.get("total_fiber", 0) or 0
+
+        g_kcal = goals.get("daily_kcal", 0) or 0
+        g_prot = goals.get("daily_protein_g", 0) or 0
+        g_carbs = goals.get("daily_carbs_g", 0) or 0
+        g_fat = goals.get("daily_fat_g", 0) or 0
+        g_fiber = goals.get("daily_fiber_g", 30) or 30
+
+        lines = [
+            f"*Heute — {totals.get('meal_count', 0)} Mahlzeiten*\n",
+            f"Kalorien:",
+            f"{self._progress_bar(kcal, g_kcal, '🟩')}",
+            f"",
+            f"Protein:",
+            f"{self._progress_bar(protein, g_prot, '🥩')}",
+            f"",
+            f"Kohlenhydrate:",
+            f"{self._progress_bar(carbs, g_carbs, '🍞')}",
+            f"",
+            f"Fett:",
+            f"{self._progress_bar(fat, g_fat, '🧈')}",
+            f"",
+            f"Ballaststoffe:",
+            f"{self._progress_bar(fiber, g_fiber, '🌿')}",
+        ]
+        return "\n".join(lines)
+
+    def _weekly_summary(self, telegram_id: int, days: int = 7) -> str:
+        data = self.db.get_multi_day_totals(telegram_id, days)
+        user = self.db.users.find_one({"telegram_id": telegram_id}) or {}
+        goals = user.get("goals", {})
+        g_kcal = goals.get("daily_kcal", 0) or 0
+
+        lines = [f"*Letzte {days} Tage*\n"]
+
+        total_kcal = 0
+        for day in data:
+            date = day["date"][5:]  # MM-DD
+            kcal = day["kcal"]
+            total_kcal += kcal
+            meals = day["meal_count"]
+
+            if meals == 0:
+                lines.append(f"`{date}` — kein Eintrag")
+                continue
+
+            # Mini-Balken (5 Zeichen breit)
+            bar = self._progress_bar(kcal, g_kcal, "🟩", width=5)
+            lines.append(f"`{date}` {bar} ({meals} Mahlz.)")
+
+        avg = total_kcal / max(sum(1 for d in data if d["meal_count"] > 0), 1)
+        lines.append(f"\nDurchschnitt: *{avg:.0f} kcal/Tag*")
+        lines.append(f"Ziel: *{g_kcal} kcal*")
 
         return "\n".join(lines)
 
