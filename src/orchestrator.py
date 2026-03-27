@@ -241,25 +241,30 @@ class Orchestrator:
     async def handle_photo(self, telegram_id: int, user_name: str,
                            photo_bytes: bytes,
                            caption: str | None = None) -> str:
+        """Handle a photo message — food recognition via two-step pipeline."""
         self.db.get_or_create_user(telegram_id, user_name)
 
-        # --- Step 1: LLaVA identifiziert nur WAS es ist ---
+        # --- Step 1: LLaVA identifiziert WAS auf dem Bild ist ---
         identify_prompt = (
-            "Was siehst du auf diesem Foto?\n"
-            "Wenn es Essen oder ein Lebensmitteletikett ist:\n"
+            "Analysiere dieses Bild und antworte auf Deutsch.\n\n"
+            "Wenn es ein Lebensmitteletikett ist:\n"
             "- Nenne den genauen Produktnamen\n"
+            "- Lies alle Nährwerte pro 100g vom Etikett ab\n"
+            "- Nenne die Gesamtmenge des Produkts (z.B. 250g)\n\n"
+            "Wenn es ein Gericht oder Essen ist:\n"
             "- Liste alle erkennbaren Zutaten auf\n"
-            "- Lies Nährwertangaben vom Etikett ab falls sichtbar\n"
-            "Antworte kurz und direkt, nur die Fakten."
+            "- Schaetze den Anteil jeder Zutat in Gramm\n"
+            "- Beschreibe die Portionsgroesse\n\n"
+            "Nur Fakten, keine Naehrwertberechnungen."
         )
         if caption:
-            identify_prompt += f"\nHinweis vom User: {caption}"
+            identify_prompt += f"\n\nHinweis vom User: {caption}"
 
-        print(f"  [Step 1] Identifying food with {VISION_MODEL}...")
+        print(f"  [Step 1] LLaVA identifies food...")
         vision_response, vision_stats = self.model_manager.vision(
             photo_bytes, identify_prompt
         )
-        print(f"  [Step 1] LLaVA says: {vision_response[:100]}...")
+        print(f"  [Step 1] LLaVA: {vision_response[:150]}...")
 
         self.db.log_usage(telegram_id, {
             "model": VISION_MODEL,
@@ -272,83 +277,180 @@ class Orchestrator:
             "action": "photo_identify",
         })
 
-        # --- Step 2: Llama extrahiert Produktname + schätzt Gewichte ---
-        parse_prompt = f"""Bildbeschreibung: "{vision_response}"
-        Userangabe: "{caption or 'keine'}"
-    
-        Aufgabe 1: Extrahiere den Produktnamen (kurz, z.B. "Koerniger Frischkaese").
-        Aufgabe 2: Wenn Nährwerte vom Etikett abgelesen wurden, nutze diese exakt.
-                   Wenn keine Nährwerte sichtbar, schaetze typische Werte pro 100g.
-        Aufgabe 3: Schaetze das Gewicht der Portion falls nicht angegeben (typische Portion).
-    
-        Antworte NUR mit diesem JSON, keine Kommentare, alle Zahlen fertig berechnet:
-        {{
-          "description": "Produktname kurz",
-          "items": [
-            {{
-              "name": "Produktname",
-              "amount_g": 100,
-              "kcal": 72,
-              "protein_g": 11,
-              "carbs_g": 3,
-              "fat_g": 2,
-              "fiber_g": 0
-            }}
-          ],
-          "confidence": "low/medium/high"
-        }}"""
+        # --- Step 2: Llama extrahiert strukturierte Liste aus LLaVA-Text ---
+        # Kein Nährwert-Schätzen — nur Namen und Mengen extrahieren
+        extract_prompt = f"""LLaVA-Bildbeschreibung: "{vision_response}"
+    User-Hinweis: "{caption or 'keiner'}"
 
-        print(f"  [Step 2] Parsing with {TEXT_MODEL}...")
-        parse_response, parse_stats = self.model_manager.reason([
-            {"role": "system",
-             "content": "Du bist ein JSON-Parser fuer Naehrwerte. Antworte NUR mit validem JSON. Keine Kommentare. Keine Berechnungen. Nur fertige Zahlen."},
-            {"role": "user", "content": parse_prompt},
+    Extrahiere eine Liste der Lebensmittel mit Mengen.
+    Antworte NUR mit diesem JSON, keine Kommentare:
+    {{
+      "items": [
+        {{
+          "name": "Produktname zum Suchen in Datenbank",
+          "amount_g": 100
+        }}
+      ],
+      "is_label": true/false
+    }}
+
+    Regeln:
+    - "name" soll der beste Suchbegriff fuer eine Lebensmitteldatenbank sein
+    - "amount_g" nur wenn klar erkennbar oder vom User angegeben, sonst 100
+    - "is_label" = true wenn es ein Nährwertetikett ist
+    - Mehrere Items bei gemischten Gerichten"""
+
+        print(f"  [Step 2] Llama extracts items...")
+        extract_response, extract_stats = self.model_manager.reason([
+            {"role": "system", "content": "Du bist ein JSON-Extraktor. Nur valides JSON, keine Kommentare."},
+            {"role": "user", "content": extract_prompt},
         ])
 
         self.db.log_usage(telegram_id, {
             "model": TEXT_MODEL,
-            "prompt_tokens": parse_stats.prompt_tokens,
-            "completion_tokens": parse_stats.completion_tokens,
-            "duration_seconds": parse_stats.duration_seconds,
-            "energy_kwh": parse_stats.energy_kwh,
-            "energy_cost_eur": parse_stats.energy_cost_eur,
-            "estimated_api_cost_usd": parse_stats.estimated_api_cost_usd,
-            "action": "photo_parse",
+            "prompt_tokens": extract_stats.prompt_tokens,
+            "completion_tokens": extract_stats.completion_tokens,
+            "duration_seconds": extract_stats.duration_seconds,
+            "energy_kwh": extract_stats.energy_kwh,
+            "energy_cost_eur": extract_stats.energy_cost_eur,
+            "estimated_api_cost_usd": extract_stats.estimated_api_cost_usd,
+            "action": "photo_extract",
         })
 
-        meal_data = self._try_parse_meal(parse_response)
+        extracted = self._try_parse_meal(extract_response)
+        if not extracted or not extracted.get("items"):
+            return (
+                f"Ich habe erkannt:\n{vision_response}\n\n"
+                f"Ich konnte keine Lebensmittel extrahieren. "
+                f"Sag mir z.B. '250g Frischkaese'."
+            )
 
-        if meal_data:
-            # --- Step 3: DB-Lookup mit Name-Retry ---
-            product_name = meal_data.get("description", "")
-            db_product = self._lookup_with_retry(product_name)
+        # --- Step 3: DB-Lookup fuer jedes Item ---
+        result_items = []
+        total = {"kcal": 0.0, "protein_g": 0.0, "carbs_g": 0.0,
+                 "fat_g": 0.0, "fiber_g": 0.0}
 
-            if db_product:
-                print(f"  [Step 3] DB hit: {db_product['name']}")
-                amount = meal_data["items"][0].get("amount_g", 100) if meal_data.get("items") else 100
-                db_product["added_by"] = telegram_id
-                return self._calculate_portion(db_product, amount)
+        for item in extracted["items"]:
+            name = item["name"]
+            amount_g = float(item.get("amount_g", 100))
 
-            # Kein DB-Treffer -> LLM-Werte nehmen
-            total = {"kcal": 0, "protein_g": 0, "carbs_g": 0, "fat_g": 0, "fiber_g": 0}
-            for item in meal_data.get("items", []):
+            print(f"  [Step 3] DB lookup: '{name}' ({amount_g}g)...")
+            product = self._lookup_with_retry(name, telegram_id)
+
+            if product:
+                factor = amount_g / 100.0
+                per100 = product["per_100g"]
+                item_total = {k: round(v * factor, 1) for k, v in per100.items()}
+
+                result_items.append({
+                    "name": product["name"],
+                    "amount_g": amount_g,
+                    "source": product.get("source", "db"),
+                    **item_total,
+                })
+
                 for key in total:
-                    total[key] += item.get(key) or 0
-            meal_data["total"] = total
-            meal_data["portion"] = 1.0
+                    total[key] += item_total.get(key, 0)
+            else:
+                # Kein DB-Treffer -> LLM schaetzt nur dieses eine Item
+                print(f"  [Step 3] No DB hit for '{name}', LLM fallback...")
+                llm_item = await self._llm_estimate_single(name, amount_g)
+                if llm_item:
+                    result_items.append(llm_item)
+                    for key in total:
+                        total[key] += llm_item.get(key, 0)
 
-            self.db.log_meal(telegram_id, meal_data)
-            self.user_state[telegram_id] = {
-                "last_action": "idle",
-                "last_meal": meal_data,
-            }
-            return self._format_meal_response(meal_data)
+        if not result_items:
+            return (
+                f"Ich habe erkannt:\n{vision_response}\n\n"
+                f"Leider konnte ich keine Nährwerte finden. "
+                f"Versuch es mit Text, z.B. '250g Frischkaese'."
+            )
 
-        return (
-            f"Ich habe erkannt:\n{vision_response}\n\n"
-            f"Naehrwerte konnte ich nicht parsen. "
-            f"Sag mir die Menge, z.B. '250g Frischkaese'."
-        )
+        meal_data = {
+            "description": extracted["items"][0]["name"] if len(extracted["items"]) == 1
+            else "Gemischte Mahlzeit",
+            "items": result_items,
+            "total": {k: round(v, 1) for k, v in total.items()},
+            "portion": 1.0,
+            "confidence": "high",
+        }
+
+        self.db.log_meal(telegram_id, meal_data)
+        self.user_state[telegram_id] = {
+            "last_action": "idle",
+            "last_meal": meal_data,
+        }
+        return self._format_meal_response(meal_data)
+
+    def _lookup_with_retry(self, name: str, telegram_id: int = 0) -> dict | None:
+        """
+        DB-Lookup mit kuerzer werdendem Namen als Fallback.
+        'Korniger Frischkaese Tworog Dovgan'
+        -> 'Korniger Frischkaese Tworog'
+        -> 'Korniger Frischkaese'
+        -> 'Frischkaese'
+        """
+        words = name.split()
+        attempts = []
+
+        # Vollstaendiger Name bis runter zum einzelnen Wort
+        for i in range(len(words), 0, -1):
+            attempts.append(" ".join(words[:i]))
+
+        # Einzelne Woerter als Extra-Fallback (nur laengere)
+        for word in words:
+            if len(word) > 4 and word not in attempts:
+                attempts.append(word)
+
+        for attempt in attempts:
+            print(f"    -> trying: '{attempt}'")
+
+            result = self.vector_store.search_best(attempt)
+            if result and result["_score"] > 0.3:
+                print(f"    -> Weaviate hit: {result['name']} ({result['_score']:.2f})")
+                return result
+
+            off = self.food_lookup.search_best(attempt)
+            if off:
+                print(f"    -> OFF hit: {off['name']}")
+                off["added_by"] = telegram_id
+                self.vector_store.add_product(off)
+                return off
+
+        return None
+
+    async def _llm_estimate_single(self, name: str, amount_g: float) -> dict | None:
+        """LLM schaetzt Naehrwerte nur wenn DB-Lookup komplett scheitert."""
+        messages = [
+            {"role": "system", "content": "Du bist ein Naehrwert-Experte. Nur valides JSON."},
+            {"role": "user", "content": f"""Schaetze Naehrwerte fuer: {amount_g}g {name}
+
+    Antworte NUR mit JSON:
+    {{
+      "name": "{name}",
+      "amount_g": {amount_g},
+      "kcal": 0,
+      "protein_g": 0,
+      "carbs_g": 0,
+      "fat_g": 0,
+      "fiber_g": 0,
+      "source": "llm_estimate"
+    }}"""},
+        ]
+        response, stats = self.model_manager.reason(messages)
+        self.db.log_usage(0, {
+            "model": TEXT_MODEL,
+            "prompt_tokens": stats.prompt_tokens,
+            "completion_tokens": stats.completion_tokens,
+            "duration_seconds": stats.duration_seconds,
+            "energy_kwh": stats.energy_kwh,
+            "energy_cost_eur": stats.energy_cost_eur,
+            "estimated_api_cost_usd": stats.estimated_api_cost_usd,
+            "action": "llm_estimate_fallback",
+        })
+        parsed = self._try_parse_meal(response)
+        return parsed if parsed else None
 
     async def handle_text(self, telegram_id: int, user_name: str,
                           text: str) -> str:
