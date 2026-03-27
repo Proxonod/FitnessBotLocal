@@ -133,6 +133,10 @@ class Orchestrator:
             signals["is_correction"] = True
         if words & correction_words:
             signals["is_correction"] = True
+
+        retry_words = {"nochmal", "nochmals", "falsch", "nicht verstanden", "wiederholen"}
+        if words & retry_words:
+            return {"intent": "voice_retry", "data": None}
         # ---- 4.1 Delete Arguments
         delete_words = {"lösch", "losch", "delete", "entfern", "raus", "weg",
                         "falsch", "cancel", "abbruch", "rückgängig"}
@@ -561,6 +565,8 @@ class Orchestrator:
         if intent["intent"] == "correct_meal":
             self.user_state[telegram_id] = {"last_action": "awaiting_correction"}
             return "✏️ Was soll ich korrigieren? Sag z.B. 'Protein war 25g' oder 'waren nur 200 kcal'"
+        if intent["intent"] == "voice_retry":
+            return "Schick mir die Sprachnachricht nochmal — ich verwende dann das groessere Modell."
         # --- Korrektur mit Werten: "Nein, waren 400 kcal" ---
         if intent["intent"] == "correct_with_values":
             macros = intent["data"]

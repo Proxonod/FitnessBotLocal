@@ -18,6 +18,11 @@ from telegram.ext import (
 )
 from src.orchestrator import Orchestrator
 from src.config import TELEGRAM_BOT_TOKEN
+from src.voice import VoiceRecognizer
+
+
+voice = VoiceRecognizer()
+
 
 
 orchestrator = Orchestrator()
@@ -62,6 +67,50 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(response, parse_mode="Markdown")
 
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    await update.message.chat.send_action("Hört Müll an")
+
+    voice_file = await context.bot.get_file(update.message.voice.file_id)
+    buf = io.BytesIO()
+    await voice_file.download_to_memory(buf)
+    audio_bytes = buf.getvalue()
+
+    print(f"  [Voice] From {user.first_name}, size: {len(audio_bytes)} bytes")
+
+    # Small model zuerst — falls confidence niedrig switcht transcribe intern
+    result = voice.transcribe(audio_bytes)
+
+    # Falls medium genutzt wurde -> User kurz informieren was passiert
+    if result["model_used"] == "medium":
+        await update.message.chat.send_action("Hört genauer hin")
+
+    text = result["text"]
+
+    if not text:
+        await update.message.reply_text(
+            "Ich konnte die Sprachnachricht nicht verstehen. "
+            "Schreib es kurz."
+        )
+        return
+
+    # State speichern
+    state = orchestrator.user_state.get(user.id, {})
+    orchestrator.user_state[user.id] = {
+        "last_action": "voice_sent",
+        "last_meal": state.get("last_meal"),
+    }
+
+    response = await orchestrator.handle_text(
+        telegram_id=user.id,
+        user_name=user.first_name,
+        text=text,
+    )
+
+    await update.message.reply_text(
+        f"_{text}_\n\n{response}",
+        parse_mode="Markdown"
+    )
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle regular text messages."""
@@ -90,7 +139,9 @@ def create_bot() -> Application:
     app.add_handler(CommandHandler("stats", lambda u, c: _cmd(u, c, "/stats")))
     app.add_handler(CommandHandler("products", lambda u, c: _cmd(u, c, "/products")))
 
+
     # Message handlers
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
