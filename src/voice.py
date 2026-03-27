@@ -38,7 +38,7 @@ class VoiceRecognizer:
             self._small = WhisperModel(
                 SMALL_MODEL,
                 device="cuda",
-                compute_type="float16",
+                compute_type="int8_float16",  # kein cuDNN noetig
             )
             print("  [Voice] Whisper small loaded")
         return self._small
@@ -49,7 +49,7 @@ class VoiceRecognizer:
             self._medium = WhisperModel(
                 MEDIUM_MODEL,
                 device="cuda",
-                compute_type="float16",
+                compute_type="int8_float16",  # kein cuDNN noetig
             )
             print("  [Voice] Whisper medium loaded")
         return self._medium
