@@ -241,32 +241,26 @@ class Orchestrator:
     async def handle_photo(self, telegram_id: int, user_name: str,
                            photo_bytes: bytes,
                            caption: str | None = None) -> str:
-        """Handle a photo message — food recognition or label OCR."""
         self.db.get_or_create_user(telegram_id, user_name)
 
-        # Build prompt based on whether there's a caption
-        # Step 1: LLaVA beschreibt frei was es sieht (kein JSON-Zwang!)
-        if caption:
-            vision_prompt = (
-                f"Der User sagt dazu: '{caption}'\n\n"
-                f"Beschreibe was du auf dem Foto siehst. "
-                f"Wenn es Essen ist, schätze Zutaten und Mengen. "
-                f"Wenn es ein Nährwert-Etikett ist, lies alle Werte ab."
-            )
-        else:
-            vision_prompt = (
-                "Beschreibe was du auf dem Foto siehst. "
-                "Wenn es Essen ist, benenne die Zutaten und schätze Mengen. "
-                "Wenn es ein Nährwert-Etikett ist, lies alle Werte ab."
-            )
-
-        # Step 1: Vision model analyzes the image
-        print(f"  👁️ Analyzing photo with {VISION_MODEL}...")
-        vision_response, vision_stats = self.model_manager.vision(
-            photo_bytes, vision_prompt
+        # --- Step 1: LLaVA identifiziert nur WAS es ist ---
+        identify_prompt = (
+            "Was siehst du auf diesem Foto?\n"
+            "Wenn es Essen oder ein Lebensmitteletikett ist:\n"
+            "- Nenne den genauen Produktnamen\n"
+            "- Liste alle erkennbaren Zutaten auf\n"
+            "- Lies Nährwertangaben vom Etikett ab falls sichtbar\n"
+            "Antworte kurz und direkt, nur die Fakten."
         )
+        if caption:
+            identify_prompt += f"\nHinweis vom User: {caption}"
 
-        # Log usage
+        print(f"  [Step 1] Identifying food with {VISION_MODEL}...")
+        vision_response, vision_stats = self.model_manager.vision(
+            photo_bytes, identify_prompt
+        )
+        print(f"  [Step 1] LLaVA says: {vision_response[:100]}...")
+
         self.db.log_usage(telegram_id, {
             "model": VISION_MODEL,
             "prompt_tokens": vision_stats.prompt_tokens,
@@ -275,38 +269,42 @@ class Orchestrator:
             "energy_kwh": vision_stats.energy_kwh,
             "energy_cost_eur": vision_stats.energy_cost_eur,
             "estimated_api_cost_usd": vision_stats.estimated_api_cost_usd,
-            "action": "photo_analysis",
+            "action": "photo_identify",
         })
 
-        # Step 2: Llama parst die Beschreibung in strukturiertes JSON
-        parse_prompt = f"""Der User hat ein Foto geschickt. Hier ist die Bildbeschreibung:
-
-        "{vision_response}"
-
-        Extrahiere die Nährwerte und antworte NUR mit diesem JSON, kein anderer Text:
+        # --- Step 2: Llama extrahiert Produktname + schätzt Gewichte ---
+        parse_prompt = f"""Bildbeschreibung: "{vision_response}"
+        Userangabe: "{caption or 'keine'}"
+    
+        Aufgabe 1: Extrahiere den Produktnamen (kurz, z.B. "Koerniger Frischkaese").
+        Aufgabe 2: Wenn Nährwerte vom Etikett abgelesen wurden, nutze diese exakt.
+                   Wenn keine Nährwerte sichtbar, schaetze typische Werte pro 100g.
+        Aufgabe 3: Schaetze das Gewicht der Portion falls nicht angegeben (typische Portion).
+    
+        Antworte NUR mit diesem JSON, keine Kommentare, alle Zahlen fertig berechnet:
         {{
-          "description": "kurze Beschreibung",
+          "description": "Produktname kurz",
           "items": [
             {{
-              "name": "Zutat",
+              "name": "Produktname",
               "amount_g": 100,
-              "kcal": 0,
-              "protein_g": 0,
-              "carbs_g": 0,
-              "fat_g": 0,
+              "kcal": 72,
+              "protein_g": 11,
+              "carbs_g": 3,
+              "fat_g": 2,
               "fiber_g": 0
             }}
           ],
           "confidence": "low/medium/high"
         }}"""
 
-        print(f"  🧠 Parsing with {TEXT_MODEL}...")
+        print(f"  [Step 2] Parsing with {TEXT_MODEL}...")
         parse_response, parse_stats = self.model_manager.reason([
-            {"role": "system", "content": "Du bist ein JSON-Parser. Antworte NUR mit validem JSON, kein anderer Text."},
+            {"role": "system",
+             "content": "Du bist ein JSON-Parser fuer Naehrwerte. Antworte NUR mit validem JSON. Keine Kommentare. Keine Berechnungen. Nur fertige Zahlen."},
             {"role": "user", "content": parse_prompt},
         ])
 
-        # Log usage for step 2
         self.db.log_usage(telegram_id, {
             "model": TEXT_MODEL,
             "prompt_tokens": parse_stats.prompt_tokens,
@@ -315,40 +313,42 @@ class Orchestrator:
             "energy_kwh": parse_stats.energy_kwh,
             "energy_cost_eur": parse_stats.energy_cost_eur,
             "estimated_api_cost_usd": parse_stats.estimated_api_cost_usd,
-            "action": "photo_parsing",
+            "action": "photo_parse",
         })
 
-        # Step 2: Try to parse as structured data
         meal_data = self._try_parse_meal(parse_response)
 
         if meal_data:
-            # Calculate totals
-            total = {"kcal": 0, "protein_g": 0, "carbs_g": 0,
-                     "fat_g": 0, "fiber_g": 0}
+            # --- Step 3: DB-Lookup mit Name-Retry ---
+            product_name = meal_data.get("description", "")
+            db_product = self._lookup_with_retry(product_name)
+
+            if db_product:
+                print(f"  [Step 3] DB hit: {db_product['name']}")
+                amount = meal_data["items"][0].get("amount_g", 100) if meal_data.get("items") else 100
+                db_product["added_by"] = telegram_id
+                return self._calculate_portion(db_product, amount)
+
+            # Kein DB-Treffer -> LLM-Werte nehmen
+            total = {"kcal": 0, "protein_g": 0, "carbs_g": 0, "fat_g": 0, "fiber_g": 0}
             for item in meal_data.get("items", []):
                 for key in total:
-                    total[key] += item.get(key, 0) or 0
-
+                    total[key] += item.get(key) or 0
             meal_data["total"] = total
             meal_data["portion"] = 1.0
 
-            # Save to DB
             self.db.log_meal(telegram_id, meal_data)
             self.user_state[telegram_id] = {
                 "last_action": "idle",
-                "last_meal": meal_data,  # behalten für Korrekturen
+                "last_meal": meal_data,
             }
+            return self._format_meal_response(meal_data)
 
-            # Format nice response
-            response = self._format_meal_response(meal_data)
-            return response
-        else:
-            # Model couldn't structure it — return raw response
-            return (
-                f"🔍 Das habe ich erkannt:\n\n{vision_response}\n\n"
-                f"Ich konnte die Nährwerte nicht automatisch parsen. "
-                f"Kannst du mir die Mengen genauer sagen?"
-            )
+        return (
+            f"Ich habe erkannt:\n{vision_response}\n\n"
+            f"Naehrwerte konnte ich nicht parsen. "
+            f"Sag mir die Menge, z.B. '250g Frischkaese'."
+        )
 
     async def handle_text(self, telegram_id: int, user_name: str,
                           text: str) -> str:
@@ -605,14 +605,15 @@ class Orchestrator:
 
         for item in meal_data.get("items", []):
             amount = item.get("amount_g", "?")
-            lines.append(f"  • {item['name']}: {amount}g → {item.get('kcal', '?')} kcal")
+            kcal = item.get('kcal') or 0
+            lines.append(f"  • {item['name']}: {amount}g -> {kcal:.0f} kcal")
 
         lines.append(f"\n📊 **Gesamt:**")
-        lines.append(f"  🔥 {total.get('kcal', 0):.0f} kcal")
-        lines.append(f"  🥩 {total.get('protein_g', 0):.0f}g Protein")
-        lines.append(f"  🍞 {total.get('carbs_g', 0):.0f}g Kohlenhydrate")
-        lines.append(f"  🧈 {total.get('fat_g', 0):.0f}g Fett")
-        lines.append(f"  🌿 {total.get('fiber_g', 0):.0f}g Ballaststoffe")
+        lines.append(f"  -> {total.get('kcal', 0) or 0:.0f} kcal")
+        lines.append(f"  -> {total.get('protein_g', 0) or 0:.0f}g Protein")
+        lines.append(f"  -> {total.get('carbs_g', 0) or 0:.0f}g KH")
+        lines.append(f"  -> {total.get('fat_g', 0) or 0:.0f}g Fett")
+        lines.append(f"  -> {total.get('fiber_g', 0) or 0:.0f}g Ballaststoffe")
         lines.append(f"\n{conf_emoji} Konfidenz: {confidence}")
 
         notes = meal_data.get("notes")
