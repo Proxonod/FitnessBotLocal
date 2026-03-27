@@ -19,6 +19,7 @@ from src.database import Database
 from src.config import TEXT_MODEL, VISION_MODEL
 from src.vector_store import VectorStore
 from src.food_lookup import FoodLookup
+from src.onboarding import OnboardingState
 
 SYSTEM_PROMPT = """Du bist ein freundlicher Ernährungs-Tracker-Assistent.
 Du hilfst beim Tracken von Mahlzeiten, Kalorien und Makronährstoffen.
@@ -73,6 +74,7 @@ class Orchestrator:
         self.food_lookup = FoodLookup()
         # Conversation state per user: {telegram_id: {"last_action": ..., "last_meal": ...}}
         self.user_state = {}
+        self.onboarding = OnboardingState()
 
     def _detect_intent(self, text: str, telegram_id: int) -> dict:
         """
@@ -103,6 +105,10 @@ class Orchestrator:
         # --- 1. Befehle (sofort raus, eindeutig) ---
         if lower.startswith("/") or lower.startswith("\\"):
             return {"intent": "command", "data": lower}
+
+        # Manuelle Goal-Eingabe: "ziel: 2000 kcal, 150g protein..."
+        if lower.startswith("ziel:") or lower.startswith("goal:") or lower.startswith("aim:"):
+            return self._parse_manual_goals(telegram_id, text)
 
         # --- 2. Grüße ---
         greetings = ("hi", "hallo", "hey", "moin", "start", "servus", "sers")
@@ -391,6 +397,35 @@ class Orchestrator:
         }
         return self._format_meal_response(meal_data)
 
+    def _parse_manual_goals(self, telegram_id: int, text: str) -> str:
+        import re
+        goals = {}
+        if m := re.search(r"(\d+)\s*kcal", text):
+            goals["daily_kcal"] = int(m.group(1))
+        if m := re.search(r"(\d+)\s*g?\s*protein", text, re.I):
+            goals["daily_protein_g"] = int(m.group(1))
+        if m := re.search(r"(\d+)\s*g?\s*fett|fat", text, re.I):
+            goals["daily_fat_g"] = int(m.group(1))
+        if m := re.search(r"(\d+)\s*g?\s*carbs|kohlenhydrate|kh", text, re.I):
+            goals["daily_carbs_g"] = int(m.group(1))
+
+        if not goals.get("daily_kcal"):
+            return "Format: *ziel: 2000 kcal, 150g protein, 60g fett, 200g carbs*"
+
+        goals.setdefault("daily_protein_g", 150)
+        goals.setdefault("daily_fat_g", 60)
+        goals.setdefault("daily_carbs_g", 200)
+        goals.setdefault("daily_fiber_g", 30)
+
+        self.db.update_user_goals(telegram_id, goals)
+        return (
+            f"Ziele gesetzt!\n"
+            f"Kalorien: *{goals['daily_kcal']} kcal*\n"
+            f"Protein: *{goals['daily_protein_g']}g*\n"
+            f"Fett: *{goals['daily_fat_g']}g*\n"
+            f"Carbs: *{goals['daily_carbs_g']}g*"
+        )
+
     def _lookup_with_retry(self, name: str, telegram_id: int = 0) -> dict | None:
         """
         DB-Lookup mit kuerzer werdendem Namen als Fallback.
@@ -464,6 +499,17 @@ class Orchestrator:
                           text: str) -> str:
         """Handle a text message with intent detection."""
         self.db.get_or_create_user(telegram_id, user_name)
+        # --- Onboarding aktiv? ---
+        if self.onboarding.is_active(telegram_id):
+            response, goals = self.onboarding.process(telegram_id, text)
+            if goals:
+                self.db.update_user_goals(telegram_id, goals)
+            return response
+
+        # --- Goals gesetzt? Sonst Onboarding starten ---
+        user = self.db.get_or_create_user(telegram_id, user_name)
+        if not user.get("goals", {}).get("daily_kcal"):
+            return self.onboarding.start(telegram_id)
 
         intent = self._detect_intent(text, telegram_id)
         print(f"  🎯 Intent: {intent['intent']}")
